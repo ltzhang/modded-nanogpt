@@ -73,20 +73,17 @@ def tokenize_document(text, enc, eot):
     return tokens_np_uint16
 
 
-def process_parquet_file(parquet_file, enc, eot, text_field="text"):
+def parquet_document_iterator(parquet_file, text_field="text"):
     """
-    Process a single parquet file and return all tokenized documents.
+    Iterator that yields tokenized documents from a parquet file.
     
     Args:
         parquet_file: Path to the parquet file
-        enc: The tiktoken encoder
-        eot: The end-of-text token ID
         text_field: Name of the text field in the parquet file
     
-    Returns:
-        List of numpy arrays of tokens (one per document)
+    Yields:
+        numpy arrays of uint16 tokens (one per document)
     """
-    tokens_list = []
     try:
         parquet_file_obj = pq.ParquetFile(parquet_file)
         
@@ -110,23 +107,22 @@ def process_parquet_file(parquet_file, enc, eot, text_field="text"):
                 if len(text_str.strip()) == 0:
                     continue
                 
-                # Tokenize the document
-                tokens = tokenize_document(text_str, enc, eot)
-                tokens_list.append(tokens)
+                yield text_str
     
     except Exception as e:
         print(f"Error processing {parquet_file}: {e}")
         raise
-    
-    return tokens_list
 
 
 def tokenize_worker(args):
-    """Worker function for parallel processing."""
+    """Worker function for parallel processing - yields tokenized documents."""
     parquet_file, enc_name, text_field = args
     enc = tiktoken.get_encoding(enc_name)
     eot = enc._special_tokens['<|endoftext|>']
-    return process_parquet_file(parquet_file, enc, eot, text_field)
+    
+    for text in parquet_document_iterator(parquet_file, text_field):
+        tokens = tokenize_document(text, enc, eot)
+        yield tokens
 
 
 def main():
@@ -198,60 +194,60 @@ def main():
     enc = tiktoken.get_encoding("gpt2")
     eot = enc._special_tokens['<|endoftext|>']
     
-    # Process parquet files (with optional parallelization)
+    # Create a document iterator that reads parquet files one at a time
+    # This yields text strings (same as fineweb.py's dataset iterator)
+    def all_documents():
+        """Iterator that yields all text documents from all parquet files, one file at a time."""
+        for parquet_file in parquet_files:
+            for text in parquet_document_iterator(parquet_file, args.text_field):
+                yield text
+    
+    # Tokenize function (exactly same as fineweb.py)
+    def tokenize(doc):
+        """Tokenizes a single document and returns a numpy array of uint16 tokens."""
+        tokens = [eot]  # the special <|endoftext|> token delimits all documents
+        tokens.extend(enc.encode_ordinary(doc))
+        tokens_np = np.array(tokens)
+        assert (0 <= tokens_np).all() and (tokens_np < 2**16).all(), "token dictionary too large for uint16"
+        tokens_np_uint16 = tokens_np.astype(np.uint16)
+        return tokens_np_uint16
+    
+    # Process documents in parallel and write shards as they fill up (exactly same as fineweb.py)
     nprocs = args.num_workers if args.num_workers is not None else max(1, os.cpu_count() - 2)
+    print(f"Processing {len(parquet_files)} parquet files with {nprocs} workers...")
     
-    all_tokens_list = []
-    
-    if nprocs > 1 and len(parquet_files) > 1:
-        print(f"Processing {len(parquet_files)} parquet files with {nprocs} workers...")
-        # Parallel processing
-        worker_args = [(f, "gpt2", args.text_field) for f in parquet_files]
-        with mp.Pool(nprocs) as pool:
-            results = pool.map(tokenize_worker, worker_args)
-        # Flatten results
-        for tokens_list in results:
-            all_tokens_list.extend(tokens_list)
-    else:
-        print(f"Processing {len(parquet_files)} parquet files sequentially...")
-        for parquet_file in tqdm(parquet_files, desc="Processing parquet files"):
-            tokens_list = process_parquet_file(parquet_file, enc, eot, args.text_field)
-            all_tokens_list.extend(tokens_list)
-    
-    print(f"Total documents processed: {len(all_tokens_list)}")
-    
-    # Write shards
+    # tokenize all documents and write output shards, each of shard_size tokens (last shard has remainder)
     shard_index = 0
+    # preallocate buffer to hold current shard
     all_tokens_np = np.empty((args.shard_size,), dtype=np.uint16)
     token_count = 0
     progress_bar = None
     
-    print("Writing shards...")
-    for tokens in tqdm(all_tokens_list, desc="Tokenizing and sharding"):
-        # is there enough space in the current shard for the new tokens?
-        if token_count + len(tokens) < args.shard_size:
-            # simply append tokens to current shard
-            all_tokens_np[token_count:token_count+len(tokens)] = tokens
-            token_count += len(tokens)
-            # update progress bar
-            if progress_bar is None:
-                progress_bar = tqdm(total=args.shard_size, unit="tokens", desc=f"Shard {shard_index}")
-            progress_bar.update(len(tokens))
-        else:
-            # write the current shard and start a new one
-            split = "val" if shard_index == 0 else "train"
-            filename = os.path.join(output_dir, f"fineweb_{split}_{shard_index:06d}.bin")
-            # split the document into whatever fits in this shard; the remainder goes to next one
-            remainder = args.shard_size - token_count
-            if progress_bar:
+    with mp.Pool(nprocs) as pool:
+        for tokens in pool.imap(tokenize, all_documents(), chunksize=16):
+            # is there enough space in the current shard for the new tokens?
+            if token_count + len(tokens) < args.shard_size:
+                # simply append tokens to current shard
+                all_tokens_np[token_count:token_count+len(tokens)] = tokens
+                token_count += len(tokens)
+                # update progress bar
+                if progress_bar is None:
+                    progress_bar = tqdm(total=args.shard_size, unit="tokens", desc=f"Shard {shard_index}")
+                progress_bar.update(len(tokens))
+            else:
+                # write the current shard and start a new one
+                split = "val" if shard_index == 0 else "train"
+                filename = os.path.join(output_dir, f"fineweb_{split}_{shard_index:06d}.bin")
+                # split the document into whatever fits in this shard; the remainder goes to next one
+                remainder = args.shard_size - token_count
                 progress_bar.update(remainder)
-            all_tokens_np[token_count:token_count+remainder] = tokens[:remainder]
-            write_datafile(filename, all_tokens_np)
-            shard_index += 1
-            progress_bar = None
-            # populate the next shard with the leftovers of the current doc
-            all_tokens_np[0:len(tokens)-remainder] = tokens[remainder:]
-            token_count = len(tokens)-remainder
+                all_tokens_np[token_count:token_count+remainder] = tokens[:remainder]
+                write_datafile(filename, all_tokens_np)
+                shard_index += 1
+                progress_bar = None
+                # populate the next shard with the leftovers of the current doc
+                all_tokens_np[0:len(tokens)-remainder] = tokens[remainder:]
+                token_count = len(tokens)-remainder
     
     # write any remaining tokens as the last shard
     if token_count != 0:
